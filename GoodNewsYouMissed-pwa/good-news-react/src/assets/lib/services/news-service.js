@@ -1,55 +1,90 @@
-// src/lib/services/news-service.js - FREE-TIER COMPLIANT
+// src/lib/services/news-service.js - WITH CONFIGURABLE STRATEGY
 import axios from 'axios';
 import { CONFIG } from '../config.js';
 import { withRetry } from '../utils.js';
 
-// Helper to get today's theme from config (UPDATED FOR FREE TIER)
-function getTodaysTheme() {
-  const today = new Date();
-  const dayIndex = today.getDay(); // 0=Sunday, 1=Monday...
-  
-  // Map Sunday (0) to index 6, Monday (1) to 0, etc.
-  const themeIndex = dayIndex === 0 ? 6 : dayIndex - 1;
-  
-  // Fallback if index is out of bounds
-  const theme = CONFIG.newsData.dailyThemes[themeIndex] || 
-               CONFIG.newsData.dailyThemes[0]; // Monday fallback
-  
-  console.log(`📅 Today is ${today.toLocaleDateString('en-US', { weekday: 'long' })}`);
-  console.log(`📅 Using theme: ${theme.category} (${theme.keyword})`);
-  
-  return theme;
-}
+// ==================== PROVIDER-SPECIFIC FETCHERS ====================
 
-// Core single-theme fetch (RESPECTS 1-CATEGORY LIMIT)
-async function fetchArticlesForTheme(theme) {
-  console.log(`📡 Fetching for ${theme.category}...`);
-
-  const apiKey = import.meta.env.VITE_NEWSDATA_API_KEY;
-  if (!apiKey || apiKey === 'your_actual_key_here') {
-    throw new Error('Missing API key. Add VITE_NEWSDATA_API_KEY to .env.local');
+async function fetchFromNewsAPI(category) {
+  const apiKey = import.meta.env.VITE_NEWSAPI_API_KEY;
+  if (!apiKey || apiKey === 'your_newsapi_key_here') {
+    throw new Error('Missing VITE_NEWSAPI_API_KEY in .env.local');
   }
 
-  // FREE-TIER SAFE PARAMETERS (NO HALLUCINATIONS!)
   const params = {
-    apikey: apiKey,
-    ...CONFIG.newsData.safeParams,  // country: 'us', language: 'en', size: 10
-    category: theme.category,       // SINGLE category only (free-tier limit)
-    // Keyword search (OPTIONAL - keep under 100 chars)
-    // q: theme.keyword.substring(0, 50)  // Free tier: 100 char max
+    ...CONFIG.apiProviders.newsapi.params,
+    category: category,
+    apiKey: apiKey
   };
 
-  // LOG THE EXACT REQUEST (for debugging)
-  console.log('🔧 Request params:', { 
-    country: params.country,
-    language: params.language,
+  console.log(`📡 [NewsAPI] Fetching ${category}...`);
+  console.log('🔧 [NewsAPI] Request params:', { 
     category: params.category,
-    size: params.size,
-    hasKeyword: !!params.q
+    pageSize: params.pageSize,
+    country: params.country
   });
 
   try {
-    const response = await axios.get(CONFIG.newsData.baseUrl, {
+    const response = await axios.get(CONFIG.apiProviders.newsapi.baseUrl, {
+      params,
+      timeout: 10000
+      // No headers to avoid CORS issues
+    });
+
+    if (!response.data?.articles) {
+      console.warn(`⚠️ [NewsAPI] No articles field for ${category}`);
+      return [];
+    }
+
+    console.log(`📊 [NewsAPI] Raw returned ${response.data.articles.length} articles for ${category}`);
+
+    const validArticles = response.data.articles
+      .filter(article => article.title && article.title.length > 10 && article.url)
+      .map(article => ({
+        title: article.title,
+        link: article.url,
+        source: article.source?.name || "Unknown Source",
+        description: article.description || '',
+        content: article.content || '',
+        publishedAt: article.publishedAt,
+        category: category.toUpperCase(),
+        image: article.urlToImage || null,
+        _provider: 'newsapi'
+      }));
+
+    console.log(`✅ [NewsAPI] Valid for ${category}: ${validArticles.length}`);
+    return validArticles;
+
+  } catch (error) {
+    console.error(`❌ [NewsAPI] Fetch failed for ${category}:`, error.message);
+    if (error.response) {
+      console.error(`📊 [NewsAPI] HTTP ${error.response.status}:`, error.response.data?.message);
+    }
+    throw error;
+  }
+}
+
+async function fetchFromNewsData(category) {
+  const apiKey = import.meta.env.VITE_NEWSDATA_API_KEY;
+  if (!apiKey || apiKey === 'your_actual_key_here') {
+    throw new Error('Missing VITE_NEWSDATA_API_KEY in .env.local');
+  }
+
+  const params = {
+    apikey: apiKey,
+    ...CONFIG.apiProviders.newsdata.params,
+    category: category,
+  };
+
+  console.log(`📡 [NewsData] Fetching ${category}...`);
+  console.log('🔧 [NewsData] Request params:', { 
+    category: params.category,
+    size: params.size,
+    country: params.country
+  });
+
+  try {
+    const response = await axios.get(CONFIG.apiProviders.newsdata.baseUrl, {
       params,
       timeout: 10000,
       headers: {
@@ -59,119 +94,239 @@ async function fetchArticlesForTheme(theme) {
     });
 
     if (!response.data?.results) {
-      console.warn("⚠️ API returned no results field");
+      console.warn(`⚠️ [NewsData] No results field for ${category}`);
       return [];
     }
 
-    console.log(`📊 Raw API returned ${response.data.results.length} articles`);
+    console.log(`📊 [NewsData] Raw returned ${response.data.results.length} articles for ${category}`);
 
-    // BASIC FILTERING (before AI)
-    const validArticles = response.data.results.filter(article => {
-      const hasTitle = article.title && article.title.length > 10;
-      const hasLink = article.link;
-      
-      // Log filtered articles for debugging
-      if (!hasTitle) {
-        console.log(`❌ Filtered: Title too short or missing - "${article.title?.substring(0, 30)}..."`);
-      }
-      if (!hasLink) {
-        console.log(`❌ Filtered: Missing link - "${article.title?.substring(0, 30)}..."`);
-      }
-      
-      return hasTitle && hasLink;
-    });
+    const validArticles = response.data.results
+      .filter(article => article.title && article.title.length > 10 && article.link)
+      .map(article => ({
+        title: article.title,
+        link: article.link,
+        source: article.source_id || "Unknown Source",
+        description: article.description || '',
+        content: article.content || '',
+        publishedAt: article.pubDate || article.publishedAt,
+        category: category.toUpperCase(),
+        image: article.image_url || null,
+        _provider: 'newsdata'
+      }));
 
-    console.log(`✅ Valid articles after basic filtering: ${validArticles.length}`);
-    
-    if (validArticles.length > 0) {
-      console.log(`📰 Sample: "${validArticles[0].title?.substring(0, 60)}..."`);
-    }
-    
+    console.log(`✅ [NewsData] Valid for ${category}: ${validArticles.length}`);
     return validArticles;
 
   } catch (error) {
-    console.error(`❌ Fetch failed for ${theme.category}:`, error.message);
-    
-    // ENHANCED ERROR LOGGING
+    console.error(`❌ [NewsData] Fetch failed for ${category}:`, error.message);
     if (error.response) {
-      console.error(`📊 HTTP ${error.response.status}:`, error.response.data);
+      console.error(`📊 [NewsData] HTTP ${error.response.status}:`, error.response.data?.message);
+    }
+    throw error;
+  }
+}
+
+// ==================== STRATEGY MANAGEMENT ====================
+
+function applyFetchStrategy() {
+  const strategy = CONFIG.fetchStrategy || 'conservative';
+  console.log(`🎯 Active fetch strategy: ${strategy.toUpperCase()}`);
+  
+  // Store original priority for restoration
+  const originalNewsdataPriority = CONFIG.apiProviders.newsdata.priority;
+  
+  if (strategy === 'aggressive') {
+    // Force NewsData to run in parallel (same priority as NewsAPI)
+    CONFIG.apiProviders.newsdata.priority = CONFIG.apiProviders.newsapi.priority;
+    console.log('⚡ AGGRESSIVE MODE: Both providers running in parallel.');
+  } else {
+    // Ensure conservative mode (NewsData as fallback)
+    CONFIG.apiProviders.newsdata.priority = originalNewsdataPriority > CONFIG.apiProviders.newsapi.priority 
+      ? originalNewsdataPriority 
+      : CONFIG.apiProviders.newsapi.priority + 1;
+  }
+  
+  return { strategy, originalNewsdataPriority };
+}
+
+function restoreProviderConfig(originalNewsdataPriority) {
+  CONFIG.apiProviders.newsdata.priority = originalNewsdataPriority;
+}
+
+// ==================== PROVIDER DISPATCHER ====================
+
+async function fetchFromProvider(providerName) {
+  const provider = CONFIG.apiProviders[providerName];
+  if (!provider || !provider.enabled) {
+    console.log(`⚠️ Provider ${providerName} not enabled or configured`);
+    return [];
+  }
+
+  console.log(`🚀 Starting ${providerName} parallel fetch...`);
+  const startTime = Date.now();
+
+  const articlePromises = provider.targetCategories.map(category => {
+    return withRetry(
+      () => {
+        if (providerName === 'newsapi') {
+          return fetchFromNewsAPI(category);
+        } else {
+          return fetchFromNewsData(category);
+        }
+      },
+      2,
+      2000
+    ).catch(err => {
+      console.warn(`⚠️ [${providerName}] Category ${category} failed, continuing:`, err.message);
+      return [];
+    });
+  });
+
+  const articleArrays = await Promise.all(articlePromises);
+  const allArticles = articleArrays.flat();
+  
+  const duration = Date.now() - startTime;
+  console.log(`🎉 [${providerName}] Fetch complete: ${allArticles.length} articles in ${duration}ms`);
+  
+  return allArticles;
+}
+
+// ==================== MAIN EXPORT ====================
+
+export async function fetchArticlesFromProviders() {
+  console.log("🚀 Starting multi-provider fetch...");
+  const startTime = Date.now();
+  
+  // Apply strategy configuration
+  const { strategy, originalNewsdataPriority } = applyFetchStrategy();
+  
+  // Get active providers sorted by priority
+  const activeProviders = Object.entries(CONFIG.apiProviders)
+    .filter(([_, config]) => config.enabled)
+    .sort((a, b) => a[1].priority - b[1].priority);
+
+  console.log(`📋 Provider execution order: ${activeProviders.map(([name]) => name).join(' → ')}`);
+  
+  let allArticles = [];
+  const minArticleThreshold = 40; // Threshold for skipping fallback in conservative mode
+
+  for (const [providerName, providerConfig] of activeProviders) {
+    try {
+      console.log(`\n🔄 Attempting provider: ${providerName} (priority ${providerConfig.priority})`);
+      const providerArticles = await fetchFromProvider(providerName);
+      allArticles = [...allArticles, ...providerArticles];
+
+      // In conservative mode, skip fallback if we have enough articles
+      if (strategy === 'conservative' && allArticles.length >= minArticleThreshold) {
+        console.log(`✅ Sufficient articles (${allArticles.length}) from ${providerName}, skipping fallback.`);
+        break;
+      }
       
-      if (error.response.status === 422) {
-        console.error('🚨 422 Error - Likely free-tier parameter violation!');
-        console.error('   Check: Single category, size ≤ 10, valid country');
+      if (strategy === 'conservative' && providerArticles.length > 0) {
+        console.log(`⚠️ Moderate article count from ${providerName} (${providerArticles.length}), will try fallback.`);
+      }
+
+    } catch (error) {
+      console.error(`💥 Provider ${providerName} failed completely:`, error.message);
+      // Continue to next provider
+    }
+  }
+
+  // Restore original provider configuration
+  restoreProviderConfig(originalNewsdataPriority);
+
+  // Deduplicate articles by link
+  const uniqueArticles = deduplicateArticles(allArticles);
+  const duration = Date.now() - startTime;
+  
+  // Calculate credits used
+  const creditsUsed = calculateCreditsUsed(activeProviders, strategy, minArticleThreshold, allArticles.length);
+  
+  console.log(`\n🎉 FINAL RESULT (${strategy.toUpperCase()} mode):`);
+  console.log(`   Total unique articles: ${uniqueArticles.length}`);
+  console.log(`   Provider distribution:`, countByProvider(uniqueArticles));
+  console.log(`   Estimated credits used: ${creditsUsed}`);
+  console.log(`   Total time: ${duration}ms`);
+  
+  if (uniqueArticles.length === 0) {
+    console.log(`⚠️ No articles fetched from any provider.`);
+  } else {
+    console.log(`   Sample: "${uniqueArticles[0]?.title?.substring(0, 60)}..."`);
+  }
+
+  return uniqueArticles;
+}
+
+// ==================== HELPER FUNCTIONS ====================
+
+function deduplicateArticles(articles) {
+  const seen = new Set();
+  return articles.filter(article => {
+    if (!article.link) return false;
+    const key = article.link.toLowerCase();
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function countByProvider(articles) {
+  const counts = {};
+  articles.forEach(article => {
+    const provider = article._provider || 'unknown';
+    counts[provider] = (counts[provider] || 0) + 1;
+  });
+  return counts;
+}
+
+function calculateCreditsUsed(activeProviders, strategy, threshold, totalArticles) {
+  if (strategy === 'aggressive') {
+    // Aggressive uses all providers
+    return activeProviders.reduce((sum, [_, config]) => sum + config.targetCategories.length, 0);
+  } else {
+    // Conservative: count until we hit threshold
+    let credits = 0;
+    let accumulatedArticles = 0;
+    
+    for (const [providerName, providerConfig] of activeProviders) {
+      credits += providerConfig.targetCategories.length;
+      // Simulate articles per provider (simplified)
+      accumulatedArticles += providerName === 'newsapi' ? 56 : 40;
+      
+      if (accumulatedArticles >= threshold) {
+        break;
       }
     }
     
-    throw error; // Re-throw for withRetry
+    return credits;
   }
 }
 
-// MAIN EXPORT: Your app calls this function
+// ==================== COMPATIBILITY WRAPPER ====================
+
 export async function fetchArticlesFromNewsDataEnhanced() {
-  console.log("🚀 Starting free-tier scheduled fetch...");
-  const startTime = Date.now();
-
-  // 1. Get today's prescribed single category
-  const todaysTheme = getTodaysTheme();
-
-  try {
-    // 2. Fetch articles with retry logic
-    const articles = await withRetry(
-      () => fetchArticlesForTheme(todaysTheme),
-      2, // maxAttempts (free tier: be conservative)
-      2000 // initialDelay (2 seconds - respect rate limits)
-    );
-
-    const duration = Date.now() - startTime;
-    
-    if (articles.length > 0) {
-      console.log(`🎉 SUCCESS: ${articles.length} articles in ${duration}ms`);
-      console.log(`   Category: ${todaysTheme.category}`);
-      console.log(`   Credits used: 1 (${199} remaining today)`);
-    } else {
-      console.log(`ℹ️ No valid articles found for ${todaysTheme.category} (${duration}ms)`);
-    }
-    
-    return articles;
-
-  } catch (error) {
-    const duration = Date.now() - startTime;
-    console.error(`💥 All fetch attempts failed after ${duration}ms`);
-    
-    // GRACEFUL FALLBACK: Return empty array, UI shows cached content
-    return [];
-  }
+  console.log("📝 Note: Using configurable multi-provider fetch");
+  return await fetchArticlesFromProviders();
 }
 
-// ADVANCED: Multi-fetch scheduler (for future use)
-export async function fetchScheduledDigest() {
-  console.log("⏰ Scheduled digest running...");
-  
-  // Respect free-tier rate limits: 30 requests/15min
-  const delayBetweenRequests = CONFIG.newsData.limits.delayBetweenRequests; // 30000ms
-  
-  const results = [];
-  
-  // Example: Fetch 2 themes with delay (morning & evening)
-  const themesToFetch = [
-    CONFIG.newsData.dailyThemes[0], // Monday tech
-    CONFIG.newsData.dailyThemes[1]  // Tuesday science (or use logic for AM/PM)
-  ];
-  
-  for (const theme of themesToFetch) {
-    try {
-      console.log(`⏳ Fetching ${theme.category}...`);
-      const articles = await fetchArticlesForTheme(theme);
-      results.push(...articles);
-      
-      // CRITICAL: Delay to respect 30 requests/15min rate limit
-      await new Promise(resolve => setTimeout(resolve, delayBetweenRequests));
-      
-    } catch (error) {
-      console.error(`Failed for ${theme.category}:`, error.message);
-      // Continue with next theme
-    }
-  }
-  
-  return results;
+// ==================== STRATEGY TEST FUNCTIONS ====================
+
+export async function testConservativeStrategy() {
+  console.log("🧪 Testing CONSERVATIVE strategy...");
+  const originalStrategy = CONFIG.fetchStrategy;
+  CONFIG.fetchStrategy = 'conservative';
+  const result = await fetchArticlesFromProviders();
+  CONFIG.fetchStrategy = originalStrategy;
+  return result;
+}
+
+export async function testAggressiveStrategy() {
+  console.log("🧪 Testing AGGRESSIVE strategy...");
+  const originalStrategy = CONFIG.fetchStrategy;
+  CONFIG.fetchStrategy = 'aggressive';
+  const result = await fetchArticlesFromProviders();
+  CONFIG.fetchStrategy = originalStrategy;
+  return result;
 }
